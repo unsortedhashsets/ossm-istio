@@ -54,6 +54,12 @@ FIPS="${FIPS:="false"}"
 TEST_HUB="${TEST_HUB:="image-registry.openshift-image-registry.svc:5000/istio-images"}"
 DEPLOY_GATEWAY_API="false"
 IBM="${IBM:-"false"}"
+# OSSM-only: OSSM-15863 IP family of the cluster under test, mirrors the upstream variable of the
+# same name (tests/integration/tests.mk, prow/integ-suite-kind.sh).
+# Valid values: "" (IPv4, the default), "IPv6", "IPv4,IPv6" or "IPv6,IPv4".
+# The order is significant: the first family is the primary one, so an IPv6-primary
+# dual-stack cluster must pass "IPv6,IPv4". All checks below are order-agnostic.
+IP_FAMILIES="${IP_FAMILIES:-""}"
 
 # Important: SKIP_TEST_RUN is a workaround until downstream tests can be executed by using this script. 
 # To execute the tests in downstream, set SKIP_TEST_RUN to true
@@ -205,6 +211,28 @@ base_cmd=(
   "--istio.test.kube.deployGatewayAPI=${DEPLOY_GATEWAY_API}"
   "--istio.test.openshift"
 )
+
+# OSSM-only: OSSM-15863 dual-stack / IPv6 single-stack support.
+# This script builds its own argv instead of going through tests/integration/tests.mk (see the
+# "TODO: Use the same arguments as integ-suite.kind.sh uses" at the top), so the IP family logic
+# from tests.mk has to be repeated here:
+#   - --istio.test.IPFamilies is what makes the framework deploy the extra single-family echo
+#     services (pkg/test/framework/components/echo/common/deployment/echos.go), i.e. it is the flag
+#     that actually puts v4<->v6 traffic into the test matrix. Without it the suite runs
+#     single-family even on a dual-stack cluster, and still passes.
+#   - tests labelled testlabel.IPv4 cannot work without IPv4-only connectivity (e.g. TestL7JWT,
+#     which fetches JWKS over the public internet - istio/istio#35835), so they are deselected.
+# --istio.test.skipVM=true is already set unconditionally above, matching upstream behaviour.
+if [ -n "${IP_FAMILIES}" ]; then
+    echo "Running with IP families: ${IP_FAMILIES}"
+    base_cmd+=("--istio.test.IPFamilies=${IP_FAMILIES}")
+    if [[ "${IP_FAMILIES}" == *"IPv6"* ]]; then
+        base_cmd+=("--istio.test.select=-ipv4")
+    fi
+    # sail-operator-setup.sh runs as the control plane installer in a child process and needs this
+    # to build a dual-stack Istio CR.
+    export IP_FAMILIES
+fi
 
 # disable PILOT_ENABLE_ALPHA_GATEWAY_API env here https://github.com/istio/istio/blob/master/tests/integration/base.yaml#L23 since there is no way how to enable experimental gw api crds on OpenShift
 helm_values="global.platform=openshift,pilot.env.PILOT_ENABLE_ALPHA_GATEWAY_API=false"

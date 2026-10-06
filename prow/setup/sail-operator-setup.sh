@@ -71,6 +71,10 @@ SAIL_IOP_FILE="$(basename "${IOP_FILE%.yaml}")-sail.yaml"
 # Control Istio Ambient mode deploy
 AMBIENT="${AMBIENT:="false"}"
 
+# OSSM-only: OSSM-15863 exported by prow/integ-suite-ocp.sh.
+# "" (IPv4, default), "IPv6", "IPv4,IPv6" or "IPv6,IPv4" - the first family is the primary one.
+IP_FAMILIES="${IP_FAMILIES:-""}"
+
 CONVERTER_BRANCH="${CONVERTER_BRANCH:-main}"
 
 # get istio version from versions.yaml
@@ -211,6 +215,19 @@ function patch_config() {
     yq eval '.spec.values.meshConfig.defaultConfig.proxyMetadata.ISTIO_META_DNS_CAPTURE = "true"' -i "$WORKDIR/$SAIL_IOP_FILE"
 
     echo "Configured Ambient mode for Istio."
+  fi
+
+  # OSSM-only: OSSM-15863 dual-stack control plane. Without this the Istio CR is IPv4-primary
+  # single-stack even on a dual-stack cluster, so the whole suite runs over IPv4 and still passes.
+  # Equivalent to the patch the Jenkins jobs apply out of band
+  # (resources/ocp/templates/istio/istio-cr-dualstack-patch.yaml in jenkins-csb-declaration).
+  if [[ "$IP_FAMILIES" == *"IPv4"* && "$IP_FAMILIES" == *"IPv6"* ]]; then
+    yq eval '
+      .spec.values.pilot.ipFamilyPolicy = "RequireDualStack" |
+      .spec.values.pilot.env.ISTIO_DUAL_STACK = "true" |
+      .spec.values.meshConfig.defaultConfig.proxyMetadata.ISTIO_DUAL_STACK = "true"
+    ' -i "$WORKDIR/$SAIL_IOP_FILE"
+    echo "Configured dual-stack mode for Istio (IP_FAMILIES=$IP_FAMILIES)."
   fi
 
   # Enable JWT and multiroot mesh for security-ca-custom profiles
