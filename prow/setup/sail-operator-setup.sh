@@ -180,6 +180,33 @@ function install_istio(){
   oc apply -f "$WORKDIR/$SAIL_IOP_FILE" || { echo "Failed to install istio"; oc get istio default -o yaml;}
   oc -n "$NAMESPACE" wait --for=condition=Available deployment/istiod --timeout=240s || { sleep 60; }
   echo "istiod created."
+  verify_dual_stack
+}
+
+# OSSM-only: OSSM-15863. Fail the run if the control plane did not actually come up dual-stack.
+# A single-stack istiod on a dual-stack cluster passes the whole suite - the tests simply never
+# exercise the second family - so without this the only symptom of patch_config silently not
+# applying (a renamed value, a reshaped IOP file, IP_FAMILIES not exported) is a green run with
+# no dual-stack coverage in it. Matched by label so revisioned installs (istiod-<rev>) count too.
+function verify_dual_stack() {
+  if [[ "$IP_FAMILIES" != *"IPv4"* || "$IP_FAMILIES" != *"IPv6"* ]]; then
+    return 0
+  fi
+  local families
+  families=$(oc -n "$NAMESPACE" get svc -l app=istiod -o jsonpath='{range .items[*]}{.metadata.name}={.spec.ipFamilies}{"\n"}{end}')
+  if [ -z "${families}" ]; then
+    echo "WARNING: IP_FAMILIES=${IP_FAMILIES} but no istiod Service found in ${NAMESPACE}; cannot verify dual-stack"
+    return 0
+  fi
+  echo "istiod Service IP families in ${NAMESPACE} (first entry is the primary family):"
+  echo "${families}"
+  if echo "${families}" | grep -qv 'IPv4.*IPv6\|IPv6.*IPv4'; then
+    echo "ERROR: IP_FAMILIES=${IP_FAMILIES} but an istiod Service is single-stack, so this suite would"
+    echo "       run single-family and still pass. The dual-stack values were not applied to the Istio CR:"
+    oc -n "$NAMESPACE" get istio -o yaml || true
+    exit 1
+  fi
+  echo "Verified: the control plane in ${NAMESPACE} is dual-stack."
 }
 
 # Install ingress and egress gateways
@@ -319,6 +346,32 @@ function patch_config() {
 }
 
 function patch_gateway_config() {
+  # OSSM-only: OSSM-15863 dual-stack gateway Services.
+  # The gateway chart leaves service.ipFamilyPolicy empty by default
+  # (manifests/charts/gateway/values.yaml), and neither prow/config/sail-operator gateway values
+  # file sets it, so the ingress and egress Services get a single ClusterIP from the cluster's
+  # primary family. Every test that drives traffic through a gateway would then only ever use
+  # that one family, even though the control plane itself is dual-stack.
+  #
+  # PreferDualStack, not RequireDualStack: the ingress gateway is a LoadBalancer Service (the
+  # chart default, and ingress-gateway-values.yaml does not override it). On AWS a dual-stack
+  # load balancer additionally needs an NLB and the aws-load-balancer-ip-address-type=dualstack
+  # annotation, so demanding RequireDualStack leaves the LB unprovisioned and the suite hangs
+  # forever on "service istio-system/istio-ingressgateway is not available yet: no ingress".
+  # PreferDualStack still gives both ClusterIP families wherever the cluster can, and never
+  # blocks provisioning. It is also what sail-operator hardcodes for Gateway API gateways
+  # (istiod chart, files/kube-gateway.yaml).
+  #
+  # `with` is used rather than `select` so the other documents in the rendered manifest survive.
+  if [[ "$IP_FAMILIES" == *"IPv4"* && "$IP_FAMILIES" == *"IPv6"* ]]; then
+    for manifest in istio-ingressgateway istio-egressgateway; do
+      yq eval -i \
+        'with(select(.kind == "Service"); .spec.ipFamilyPolicy = "PreferDualStack")' \
+        "${WORKDIR}/${manifest}.yaml"
+    done
+    echo "Configured dual-stack mode for the gateway Services (IP_FAMILIES=$IP_FAMILIES)."
+  fi
+
   if [[ "$WORKDIR" == *"gatewayinstance"* ]]; then
     # mesh has different name. Remove `sidecar.istio.io/inject`` and add `istio.io/rev: mesh`` label/annotation
     yq eval '
